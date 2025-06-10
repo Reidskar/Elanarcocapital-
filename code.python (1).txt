@@ -1,0 +1,420 @@
+"""
+Bot de Telegram avanzado para informes diarios sobre economía y geopolítica.
+Integrado con OpenAI GPT-4 y Google Drive para recibir, clasificar y generar informes.
+Ejecutarse en PythonAnywhere 24/7.
+
+Requerimientos:
+- python-telegram-bot
+- openai
+- google-api-python-client
+- google-auth-httplib2
+- google-auth-oauthlib
+- python-docx
+- pytz
+
+Configuración requerida:
+- Variables de entorno:
+  - TELEGRAM_BOT_TOKEN
+  - OPENAI_API_KEY
+- Archivos:
+  - credentials.json: Google API OAuth2 client secret
+  - token.json: Token de acceso de Google API
+"""
+
+import os
+import logging
+import asyncio
+import datetime
+import json
+from io import BytesIO
+from typing import List, Dict, Optional
+
+import pytz
+import openai
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload, MediaFileUpload
+
+from telegram import (
+    Update, InputFile, ChatAction, InlineKeyboardMarkup, InlineKeyboardButton,
+    ParseMode, MessageEntity
+)
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes,
+    CallbackQueryHandler, filters
+)
+
+from docx import Document
+from docx.shared import Inches, Pt
+from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
+
+# --- CONFIG ---
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "YOUR_OPENAI_API_KEY")
+GOOGLE_CREDENTIALS_FILE = 'credentials.json'
+TOKEN_FILE = 'token.json'
+
+ROOT_FOLDER_ID = "1XJtm-nLkI_ArAEwKv8iaG2VpPQIMXC8R"  # 'RAW'
+CLASSIFIED_FOLDER_ID = "15HhoZ3OjOWmUQ_xW6VY0WnZ6X57H4ov1"  # 'CLASSIFIED'
+REPORTS_FOLDER_ID = "171_S78635eoLHih3sL8k2djLsqlTuywB"  # 'INFORMES_DIARIOS'
+MASTER_PROMPT_FILE_ID = "1XJtm-nLkI_ArAEwKv8iaG2VpPQIMXC8R"  # Archivo de prompt maestro
+
+TIMEZONE = pytz.timezone('America/Santiago')
+DAY_END_HOUR = 23
+DAY_END_MINUTE = 30
+
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+openai.api_key = OPENAI_API_KEY
+
+# --- UTILIDADES DE FECHA Y HORA ---
+def now_in_tz():
+    return datetime.datetime.now(tz=TIMEZONE)
+
+def current_day(dt: datetime.datetime):
+    cutoff = dt.replace(hour=DAY_END_HOUR, minute=DAY_END_MINUTE, second=0, microsecond=0)
+    return (dt + datetime.timedelta(days=1)).date() if dt > cutoff else dt.date()
+
+def date_str(date: datetime.date):
+    return date.strftime('%Y-%m-%d')
+
+# --- GOOGLE DRIVE MANAGER ---
+class DriveManager:
+    def __init__(self):
+        self.creds = None
+        self.service = None
+        self.authenticate()
+
+    def authenticate(self):
+        if os.path.exists(TOKEN_FILE):
+            self.creds = Credentials.from_authorized_user_file(TOKEN_FILE, ['https://www.googleapis.com/auth/drive'])
+        if not self.creds or not self.creds.valid:
+            if self.creds and self.creds.expired and self.creds.refresh_token:
+                self.creds.refresh(Request())
+            else:
+                flow = InstalledAppFlow.from_client_secrets_file(GOOGLE_CREDENTIALS_FILE, ['https://www.googleapis.com/auth/drive'])
+                self.creds = flow.run_local_server(port=0)
+            with open(TOKEN_FILE, 'w') as token:
+                token.write(self.creds.to_json())
+        self.service = build('drive', 'v3', credentials=self.creds)
+        logger.info("Google Drive autenticado correctamente.")
+
+    def find_folder(self, name: str, parent: str) -> Optional[str]:
+        query = f"mimeType='application/vnd.google-apps.folder' and trashed=false and name='{name}' and '{parent}' in parents"
+        res = self.service.files().list(q=query, fields='files(id)').execute()
+        files = res.get('files', [])
+        return files[0]['id'] if files else None
+
+    def create_folder(self, name: str, parent: str) -> str:
+        metadata = {'name': name, 'mimeType': 'application/vnd.google-apps.folder', 'parents': [parent]}
+        folder = self.service.files().create(body=metadata, fields='id').execute()
+        logger.info(f"Carpeta creada: {name} ({folder.get('id')})")
+        return folder.get('id')
+
+    def get_or_create_folder(self, name: str, parent: str) -> str:
+        folder_id = self.find_folder(name, parent)
+        if folder_id:
+            return folder_id
+        return self.create_folder(name, parent)
+
+    def upload_bytes(self, folder_id: str, filename: str, content: bytes, mimetype: str) -> str:
+        from googleapiclient.http import MediaIoBaseUpload
+        fh = BytesIO(content)
+        media = MediaIoBaseUpload(fh, mimetype=mimetype)
+        metadata = {'name': filename, 'parents': [folder_id]}
+        file = self.service.files().create(body=metadata, media_body=media, fields='id').execute()
+        logger.info(f"Archivo '{filename}' subido a carpeta {folder_id}")
+        return file['id']
+
+    def read_text_file(self, file_id: str) -> str:
+        from googleapiclient.http import MediaIoBaseDownload
+        request = self.service.files().get_media(fileId=file_id)
+        fh = BytesIO()
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+        fh.seek(0)
+        return fh.read().decode('utf-8')
+
+    def get_master_prompt(self) -> str:
+        try:
+            prompt = self.read_text_file(MASTER_PROMPT_FILE_ID)
+            logger.info("Prompt maestro cargado desde Drive.")
+            return prompt
+        except Exception as e:
+            logger.warning(f"Error cargando prompt maestro: {e}")
+            return ""
+
+# --- INFORME DIARIO ---
+class InformeDiario:
+    def __init__(self, date: datetime.date, drive: DriveManager):
+        self.date = date
+        self.drive = drive
+        self.events: List[Dict] = []
+        self.historical_context: str = ""
+
+    def add_event(self, event: Dict):
+        self.events.append(event)
+        logger.info(f"Evento agregado: {event.get('summary', '')[:20]}...")
+
+    def load_historical_context(self):
+        self.historical_context = self.drive.get_master_prompt()
+
+    def generate_report_bytes(self) -> bytes:
+        logger.info("Generando informe Word...")
+        doc = Document()
+
+        # Portada
+        p = doc.add_paragraph()
+        p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+        r = p.add_run("Elanarcocapital\n")
+        r.font.size = Pt(48)
+        r.bold = True
+        doc.add_paragraph(f"Informe Diario - {self.date.strftime('%Y-%m-%d')}", style='Title')
+
+        doc.add_page_break()
+
+        # Contexto histórico
+        doc.add_heading("Contexto Histórico", level=1)
+        doc.add_paragraph(self.historical_context or "No disponible.")
+
+        doc.add_page_break()
+
+        # Eventos del día
+        doc.add_heading("Eventos del Día", level=1)
+        for e in self.events:
+            p = doc.add_paragraph()
+            p.add_run(f"Resumen: {e.get('summary','')}\n").bold = True
+            p.add_run(f"Continente: {e.get('continent', '')}\n")
+            p.add_run(f"Tipo: {e.get('event_type', '')}\n")
+            p.add_run(f"Importancia: {e.get('importance', '')}\n")
+            p.add_run(f"Muertos: {e.get('deaths', '')}\n")
+            if e.get('declarations'):
+                p.add_run(f"Declaraciones: {e.get('declarations')}\n")
+            if e.get('links'):
+                p.add_run("Links:\n")
+                for lnk in e.get('links', []):
+                    p.add_run(f"- {lnk}\n")
+            if e.get('analysis'):
+                p.add_run(f"Análisis:\n{e.get('analysis')[:1000]}\n")
+
+        bio = BytesIO()
+        doc.save(bio)
+        bio.seek(0)
+        logger.info("Informe generado con éxito.")
+        return bio.read()
+
+# --- GPT INTEGRATION ---
+async def openai_chat(messages: List[Dict], model="gpt-4", temperature=0.6, max_tokens=1500) -> str:
+    try:
+        resp = await openai.ChatCompletion.acreate(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens
+        )
+        return resp.choices[0].message.content
+    except Exception as e:
+        logger.error(f"OpenAI error: {e}")
+        return "Error procesando solicitud OpenAI"
+
+async def analyze_text_with_gpt(text: str, master_prompt: str) -> Dict:
+    prompt = f"""
+Eres experto en geopolítica y economía, haces análisis fiable y verificas info. Analiza y extrae:
+
+1. Resumen (máx 5 líneas)
+2. Continente
+3. Tipo de evento
+4. Importancia (1-5)
+5. Declaraciones
+6. Muertos
+7. Links/Vídeos/Imágenes relevantes
+8. Análisis para informe
+
+Texto:
+\"\"\"
+{text}
+\"\"\"
+
+Devuelve solo JSON con las llaves: summary, continent, event_type, importance, declarations, deaths, links, images, analysis.
+"""
+
+    messages = [{"role": "system", "content": master_prompt}, {"role": "user", "content": prompt}]
+    response = await openai_chat(messages)
+    try:
+        return json.loads(response)
+    except Exception as e:
+        logger.error(f"JSON inválido del GPT: {e}")
+        return {
+            "summary": text[:300],
+            "continent": "Desconocido",
+            "event_type": "Desconocido",
+            "importance": 3,
+            "declarations": "",
+            "deaths": "Desconocido",
+            "links": [],
+            "images": [],
+            "analysis": "",
+        }
+
+# --- TELEGRAM BOT CLASS ---
+class TelegramBot:
+    def __init__(self):
+        self.drive = DriveManager()
+        self.application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+        self.master_prompt = self.drive.get_master_prompt()
+        self.informes: Dict[str, InformeDiario] = {}
+
+        # Comandos
+        self.application.add_handler(CommandHandler("start", self.cmd_start))
+        self.application.add_handler(CommandHandler("nota", self.cmd_add_note))
+        self.application.add_handler(CommandHandler("resumen", self.cmd_generate_report))
+        self.application.add_handler(CommandHandler("cerrar", self.cmd_close_day))
+        self.application.add_handler(CommandHandler("estado", self.cmd_status))
+        self.application.add_handler(CommandHandler("revisar", self.cmd_review_report))
+        self.application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, self.handle_message))
+
+    async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text(
+            "👋 Bienvenido a Elanarcocapital Bot.\n"
+            "Comandos disponibles:\n"
+            "/nota [texto] - Añade una nota\n"
+            "/resumen - Genera informe diario\n"
+            "/cerrar - Cierra y guarda el día\n"
+            "/estado - Consulta estado\n"
+            "/revisar - Revisa el último informe generado"
+        )
+
+    async def cmd_add_note(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        text = " ".join(context.args).strip()
+        if not text:
+            await update.message.reply_text("⚠️ Usa /nota seguido del texto para añadir una nota.")
+            return
+        now = now_in_tz()
+        day = current_day(now)
+        inf = self.informes.setdefault(date_str(day), InformeDiario(day, self.drive))
+        event = {
+            "timestamp": now,
+            "continent": "N/A",
+            "event_type": "Nota",
+            "importance": 3,
+            "summary": text,
+            "declarations": "",
+            "deaths": None,
+            "links": [],
+            "images": [],
+            "analysis": "",
+        }
+        inf.add_event(event)
+        await update.message.reply_text("✅ Nota agregada exitosamente.")
+
+    async def cmd_generate_report(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        now = now_in_tz()
+        day = current_day(now)
+        ds = date_str(day)
+        inf = self.informes.get(ds)
+        if not inf or not inf.events:
+            await update.message.reply_text("No hay eventos para hoy.")
+            return
+        inf.load_historical_context()
+        bytes_doc = inf.generate_report_bytes()
+        bio = BytesIO(bytes_doc)
+        bio.name = f"Informe_Elanarcocapital_{ds}.docx"
+        await update.message.reply_chat_action(ChatAction.UPLOAD_DOCUMENT)
+        await update.message.reply_document(document=InputFile(bio))
+
+    async def cmd_close_day(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        now = now_in_tz()
+        day = current_day(now)
+        ds = date_str(day)
+        inf = self.informes.pop(ds, None)
+        if not inf:
+            await update.message.reply_text("No hay datos para cerrar.")
+            return
+        folder_day = self.drive.get_or_create_folder(ds, ROOT_FOLDER_ID)
+        report_bytes = inf.generate_report_bytes()
+        self.drive.upload_bytes(REPORTS_FOLDER_ID, f"Informe_{ds}.docx", report_bytes, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        await update.message.reply_text(f"✅ Día cerrado y reporte guardado en Drive (carpeta {ds}).")
+
+    async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        now = now_in_tz()
+        day = current_day(now)
+        ds = date_str(day)
+        inf = self.informes.get(ds)
+        count = len(inf.events) if inf else 0
+        await update.message.reply_text(f"📅 Informe de {ds}: {count} eventos registrados.")
+
+    async def cmd_review_report(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        now = now_in_tz()
+        day = current_day(now)
+        ds = date_str(day)
+        inf = self.informes.get(ds)
+        if not inf or not inf.events:
+            await update.message.reply_text("No hay informes para revisar.")
+            return
+        # Aquí se puede implementar una revisión exhaustiva de los informes
+        errors = self.review_report(inf)
+        if errors:
+            await update.message.reply_text(f"⚠️ Se encontraron errores en el informe:\n{errors}")
+        else:
+            await update.message.reply_text("✅ El informe está listo para ser enviado.")
+
+    def review_report(self, informe: InformeDiario) -> str:
+        """Revisa el informe en busca de errores comunes."""
+        errors = []
+        for event in informe.events:
+            if not event.get('summary'):
+                errors.append("Falta resumen en un evento.")
+            if not event.get('continent'):
+                errors.append("Falta continente en un evento.")
+            if not event.get('event_type'):
+                errors.append("Falta tipo de evento en un evento.")
+            if event.get('importance') not in range(1, 6):
+                errors.append("Importancia fuera de rango (1-5) en un evento.")
+        return "\n".join(errors) if errors else ""
+
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        msg = update.message
+        if not msg:
+            return
+        now = now_in_tz()
+        day = current_day(now)
+        ds = date_str(day)
+        input_text = ""
+        if msg.text:
+            input_text += msg.text + "\n"
+        if msg.caption:
+            input_text += msg.caption + "\n"
+
+        await update.message.reply_chat_action(ChatAction.TYPING)
+        gpt_data = await analyze_text_with_gpt(input_text, self.master_prompt)
+        event = {
+            "timestamp": now,
+            "continent": gpt_data.get('continent', 'Desconocido'),
+            "event_type": gpt_data.get('event_type', 'General'),
+            "importance": gpt_data.get('importance', 3),
+            "summary": gpt_data.get('summary', input_text),
+            "declarations": gpt_data.get('declarations', ''),
+            "deaths": gpt_data.get('deaths', None),
+            "links": gpt_data.get('links', []),
+            "images": gpt_data.get('images', []),
+            "analysis": gpt_data.get('analysis', ''),
+        }
+        inf = self.informes.setdefault(ds, InformeDiario(day, self.drive))
+        inf.add_event(event)
+
+        text_response = format_event_for_mobile(event)
+        await update.message.reply_text(text_response, parse_mode=ParseMode.MARKDOWN)
+
+    def run(self):
+        logger.info("Iniciando bot...")
+        self.application.run_polling()
+
+if __name__ == "__main__":
+    TelegramBot().run()
